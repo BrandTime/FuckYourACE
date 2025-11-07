@@ -87,4 +87,3 @@
 
 本项目采用 [MIT License](LICENSE) 授权。
 
-（**建议**：你需要在你的项目根目录**新建一个名为 `LICENSE` 的文件**，并将 [MIT 许可证的文本](https://opensource.org/licenses/MIT) 复制进去。）
