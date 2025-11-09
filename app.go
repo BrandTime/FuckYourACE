@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync/atomic" // 引入原子操作，安全地增加计数
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -19,18 +23,44 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// 云端后台 API 地址
+const (
+	// !! 警告：请将这里替换为你的真实后台服务器 API 地址
+	backendURL = "https://your-api-server.com/api"
+)
+
+// CloudConfig 定义了从云端获取的配置结构
+type CloudConfig struct {
+	ProcessList     []string `json:"process_list"`
+	Announcement    string   `json:"announcement"`
+	TotalExecutions uint64   `json:"total_executions"`
+	OnlineUsers     int      `json:"online_users"`
+}
+
 // App 结构体
 type App struct {
 	ctx            context.Context
 	fileLogger     *log.Logger
 	logFile        *os.File
 	logPath        string
-	executionCount uint64 // 执行计数器
+	executionCount uint64 // 本地执行计数器
+
+	// 云端控制相关
+	clientID        string       // 客户端唯一ID
+	targetProcesses []string     // 从云端获取的目标进程列表
+	cloudConfig     CloudConfig  // 存储云端配置
+	httpClient      *http.Client // HTTP 客户端
 }
 
 // NewApp 创建一个新的 App 应用结构体
 func NewApp() *App {
-	return &App{}
+	return &App{
+		// 默认的进程列表，作为获取失败时的后备
+		targetProcesses: []string{"SGuard64.exe", "SGuardSvc64.exe"},
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second, // 10秒超时
+		},
+	}
 }
 
 // startup 在 Wails 启动时调用
@@ -42,6 +72,10 @@ func (a *App) startup(ctx context.Context) {
 	if err != nil {
 		a.Logf("!!! 警告：本地日志文件创建失败: %v", err)
 	}
+
+	// 异步初始化
+	go a.initClientID()
+	go a.fetchCloudConfig() // 尝试获取云端配置
 
 	// 启动主程序循环
 	go a.runLoop()
@@ -56,6 +90,141 @@ func (a *App) shutdown(ctx context.Context) {
 	}
 }
 
+// initClientID 初始化客户端唯一ID
+func (a *App) initClientID() {
+	// 尝试获取唯一的机器 ID
+	info, err := host.InfoWithContext(a.ctx)
+	if err != nil {
+		a.Logf("!!! 警告：获取客户端ID失败: %v", err)
+		a.clientID = "unknown-client"
+		return
+	}
+	a.clientID = info.HostID
+	if a.clientID == "" {
+		a.clientID = "unknown-host-id"
+	}
+	a.fileLogger.Printf("Client ID set to: %s", a.clientID)
+}
+
+// fetchCloudConfig 从云端获取配置
+func (a *App) fetchCloudConfig() {
+	a.Logf("... 正在连接云端获取配置 ...")
+	req, err := http.NewRequestWithContext(a.ctx, "GET", backendURL+"/config", nil)
+	if err != nil {
+		a.Logf("!!! 警告：创建云端请求失败: %v", err)
+		return
+	}
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		a.Logf("!!! 警告：连接云端失败: %v", err)
+		a.Logf("... 将使用默认配置运行 ...")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		a.Logf("!!! 警告：云端服务器返回状态: %s", resp.Status)
+		return
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		a.Logf("!!! 警告：读取云端响应失败: %v", err)
+		return
+	}
+
+	var config CloudConfig
+	if err := json.Unmarshal(body, &config); err != nil {
+		a.Logf("!!! 警告：解析云端配置失败: %v", err)
+		return
+	}
+
+	a.cloudConfig = config // 存储公告
+	if len(config.ProcessList) > 0 {
+		a.targetProcesses = config.ProcessList // 替换进程列表
+		a.Logf("✅ 云端配置同步成功！")
+		a.Logf("... 目标进程列表已更新: %v", a.targetProcesses)
+	} else {
+		a.Logf("... 云端未提供进程列表，使用默认配置 ...")
+	}
+	//启动时统计一次使用
+	wailsRuntime.EventsEmit(a.ctx, "stats-update", config.OnlineUsers, config.TotalExecutions)
+}
+
+// sendHeartbeat 发送心跳到后台
+func (a *App) sendHeartbeat() {
+	if a.clientID == "" {
+		return // 还未获取到ID
+	}
+
+	data := map[string]string{"client_id": a.clientID}
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		a.fileLogger.Printf("Heartbeat marshal error: %v", err) // 心跳失败只记录到文件
+		return
+	}
+
+	req, err := http.NewRequestWithContext(a.ctx, "POST", backendURL+"/heartbeat", bytes.NewBuffer(jsonData))
+	if err != nil {
+		a.fileLogger.Printf("Heartbeat request create error: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		a.fileLogger.Printf("Heartbeat send error: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		a.fileLogger.Println("Heartbeat sent successfully.")
+	} else {
+		a.fileLogger.Printf("Heartbeat server response: %s", resp.Status)
+	}
+}
+
+// fetchServerStats 循环获取最新的统计数据
+func (a *App) fetchServerStats() {
+	if a.ctx.Err() != nil {
+		return // 检查上下文是否已取消
+	}
+	req, err := http.NewRequestWithContext(a.ctx, "GET", backendURL+"/config", nil)
+	if err != nil {
+		a.fileLogger.Printf("Stats fetch request error: %v", err)
+		return
+	}
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		a.fileLogger.Printf("Stats fetch send error: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		a.fileLogger.Printf("Stats fetch server error: %s", resp.Status)
+		return
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		a.fileLogger.Printf("Stats fetch read body error: %v", err)
+		return
+	}
+
+	var stats CloudConfig
+	if err := json.Unmarshal(body, &stats); err != nil {
+		a.fileLogger.Printf("解析云端统计失败: %v", err)
+		return
+	}
+
+	// 向前端发送最新统计数据
+	wailsRuntime.EventsEmit(a.ctx, "stats-update", stats.OnlineUsers, stats.TotalExecutions)
+}
+
 // runLoop 是程序的主循环
 func (a *App) runLoop() {
 	// 等待前端 "ready" 事件
@@ -65,16 +234,41 @@ func (a *App) runLoop() {
 			wailsRuntime.EventsEmit(a.ctx, "logpath", a.logPath)
 		}
 
-		// 记录系统信息 (只在启动时记录一次)
+		// 记录系统信息
 		a.logSystemInfo()
 
 		a.Logf("欢迎使用 Fuck your ACE！")
 		a.Logf("请以管理员方式运行本程序。")
 		a.Logf("绑定失败时，请以管理员方式重新启动程序。")
 
+		// 显示云端公告
+		time.Sleep(2 * time.Second)
+		if a.cloudConfig.Announcement != "" {
+			a.Logf("--- 云端公告 ---")
+			a.Logf(a.cloudConfig.Announcement)
+			a.Logf("----------------")
+		}
+
+		// 启动一个独立的goroutine来定期刷新统计数据
+		go func() {
+			statsTicker := time.NewTicker(15 * time.Second)
+			defer statsTicker.Stop()
+
+			for {
+				select {
+				case <-a.ctx.Done(): // 程序退出
+					return
+				case <-statsTicker.C:
+					a.fetchServerStats() // 定期获取统计
+				}
+			}
+		}()
+
 		// 开始无限循环
 		for {
 			a.RunBindingProcess()
+			// 每次循环发送心跳（这将自动增加服务器的总执行次数）
+			go a.sendHeartbeat()
 			a.runCountdown() // 执行60秒倒计时
 		}
 	})
@@ -146,7 +340,6 @@ func (a *App) logSystemInfo() {
 }
 
 // Logf 会将日志同时写入文件和发送到 UI 界面
-// 它会逐行发送日志，并带有短暂延迟
 func (a *App) Logf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 
@@ -163,7 +356,6 @@ func (a *App) Logf(format string, args ...interface{}) {
 }
 
 // RunBindingProcess 执行核心绑定流程
-// 增加计数器和 "执行开始" 事件
 func (a *App) RunBindingProcess() {
 	// 原子增加执行次数
 	atomic.AddUint64(&a.executionCount, 1)
@@ -191,14 +383,15 @@ func (a *App) RunBindingProcess() {
 		a.Logf("✅  采用最佳方案：绑定到第一个能效核 (CPU %d)", targetCore)
 	}
 
-	pids, err := getTargetPIDs()
+	pids, err := a.getTargetPIDs()
 	if err != nil {
 		a.Logf("❌ 获取目标进程失败：%v", err)
 		return
 	}
 
 	if len(pids) == 0 {
-		a.Logf("ℹ️  未找到目标进程 (%s / %s)", winTargetProc1, winTargetProc2)
+		targetProcsStr := strings.Join(a.targetProcesses, " / ")
+		a.Logf("ℹ️  未找到目标进程 (%s)", targetProcsStr)
 	} else {
 		a.Logf("✅ 找到目标进程 PID：%v", pids)
 		successCount := 0
@@ -215,14 +408,7 @@ func (a *App) RunBindingProcess() {
 	a.Logf("----------------------------------")
 }
 
-// -------------------------- 1. 全局配置（Windows 专属） --------------------------
-const (
-	winTargetProc1 = "SGuard64.exe"
-	winTargetProc2 = "SGuardSvc64.exe"
-)
-
-// -------------------------- 1.5. Windows API 动态加载 -----------------
-// 延迟加载 kernel32.dll，避免启动时就加载
+// --- Windows API 动态加载 ---
 var (
 	modkernel32 = windows.NewLazySystemDLL("kernel32.dll")
 
@@ -230,23 +416,20 @@ var (
 	procSetProcessAffinityMask           = modkernel32.NewProc("SetProcessAffinityMask")
 )
 
-// ... (所有 API 帮助函数和 Struct 定义保持不变) ...
+// --- Windows API 帮助函数 ---
 
-// 帮助函数：调用 GetLogicalProcessorInformationEx
 func _getLogicalProcessorInformationEx(relationship LOGICAL_PROCESSOR_RELATIONSHIP, buffer *byte, length *uint32) (err error) {
 	ret, _, err := procGetLogicalProcessorInformationEx.Call(
 		uintptr(relationship),
 		uintptr(unsafe.Pointer(buffer)),
 		uintptr(unsafe.Pointer(length)),
 	)
-	// 检查返回值 ret，而不是只检查 err
 	if ret == 0 {
 		return err
 	}
 	return nil
 }
 
-// 帮助函数：调用 SetProcessAffinityMask
 func _setProcessAffinityMask(handle windows.Handle, mask uintptr) (err error) {
 	ret, _, err := procSetProcessAffinityMask.Call(
 		uintptr(handle),
@@ -258,17 +441,13 @@ func _setProcessAffinityMask(handle windows.Handle, mask uintptr) (err error) {
 	return nil
 }
 
-// Windows API 常量和结构体
-// (这部分注释是必要的文档，予以保留)
-
+// --- Windows API 常量和结构体 ---
 type LOGICAL_PROCESSOR_RELATIONSHIP uint32
 
 const (
 	RelationProcessorCore LOGICAL_PROCESSOR_RELATIONSHIP = 0
 )
 const (
-	// https://docs.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-processor_relationship
-	// 0x04 (Bit 2): The processor is an E-core (efficient core).
 	ProcessorEfficientCore byte = 4
 )
 
@@ -289,23 +468,16 @@ type SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX struct {
 	Processor    PROCESSOR_RELATIONSHIP
 }
 
-const (
-	PROCESS_ALL_ACCESS = 0x1F0FFF
-)
-
-// getEfficientCores (能效核)
-// 使用 GetLogicalProcessorInformationEx 查找所有 E-Cores 的索引
+// getEfficientCores 查找能效核 (E-Cores)
 func getEfficientCores() ([]int, error) {
 	var bufferSize uint32 = 0
 
-	// 第一次调用，获取所需的缓冲区大小
 	err := _getLogicalProcessorInformationEx(RelationProcessorCore, nil, &bufferSize)
 	if err != nil && err.(windows.Errno) != windows.ERROR_INSUFFICIENT_BUFFER {
 		return nil, fmt.Errorf("无法获取 CPU 信息 (GetLogicalProcessorInformationEx 第一次调用失败): %v", err)
 	}
 
 	buffer := make([]byte, bufferSize)
-	// 第二次调用，获取实际数据
 	err = _getLogicalProcessorInformationEx(RelationProcessorCore, &buffer[0], &bufferSize)
 	if err != nil {
 		return nil, fmt.Errorf("读取 CPU 信息失败：%v", err)
@@ -314,16 +486,13 @@ func getEfficientCores() ([]int, error) {
 	var efficientCores []int
 	var offset uintptr = 0
 
-	// 遍历返回的数据结构
 	for offset < uintptr(bufferSize) {
 		lpi := (*SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(unsafe.Pointer(&buffer[offset]))
 
 		if lpi.Relationship == RelationProcessorCore {
 			procRel := lpi.Processor
 
-			// 检查 Flags 是否包含 E-core 标记
 			if (procRel.Flags & ProcessorEfficientCore) != 0 {
-				// 遍历所有的 CPU 组
 				for i := 0; i < int(procRel.GroupCount); i++ {
 					groupMask := (*GROUP_AFFINITY)(unsafe.Pointer(
 						uintptr(unsafe.Pointer(&procRel.GroupMask[0])) +
@@ -333,16 +502,13 @@ func getEfficientCores() ([]int, error) {
 					mask := groupMask.Mask
 					group := groupMask.Group
 
-					// 遍历掩码中的每一位
 					for j := 0; j < 64; j++ {
 						if (mask & (1 << j)) != 0 {
-							// 计算 CPU 的全局索引
 							cpuIndex := (int(group) * 64) + j
 							efficientCores = append(efficientCores, cpuIndex)
 						}
 					}
 				}
-				// 找到 E-core 组后就可以停止了
 				if len(efficientCores) > 0 {
 					break
 				}
@@ -352,7 +518,7 @@ func getEfficientCores() ([]int, error) {
 		if lpi.Size == 0 {
 			break
 		}
-		offset += uintptr(lpi.Size) // 移动到下一个条目
+		offset += uintptr(lpi.Size)
 	}
 
 	if len(efficientCores) == 0 {
@@ -362,7 +528,16 @@ func getEfficientCores() ([]int, error) {
 }
 
 // getTargetPIDs 查找目标进程的 PID 列表
-func getTargetPIDs() ([]int, error) {
+func (a *App) getTargetPIDs() ([]int, error) {
+	targetMap := make(map[string]bool)
+	for _, proc := range a.targetProcesses {
+		targetMap[proc] = true
+	}
+
+	if len(targetMap) == 0 {
+		return nil, fmt.Errorf("目标进程列表为空")
+	}
+
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		return nil, fmt.Errorf("创建进程快照失败：%v", err)
@@ -381,7 +556,7 @@ func getTargetPIDs() ([]int, error) {
 	for {
 		procName := windows.UTF16ToString(entry.ExeFile[:])
 
-		if procName == winTargetProc1 || procName == winTargetProc2 {
+		if _, found := targetMap[procName]; found {
 			pids = append(pids, int(entry.ProcessID))
 		}
 
@@ -399,7 +574,8 @@ func getTargetPIDs() ([]int, error) {
 
 // bindToEfficientCore 将指定 PID 绑定到核心并设置优先级
 func bindToEfficientCore(pid int, core int) error {
-	handle, err := windows.OpenProcess(PROCESS_ALL_ACCESS, false, uint32(pid))
+	// 使用最小权限，避免杀毒软件误报
+	handle, err := windows.OpenProcess(windows.PROCESS_SET_INFORMATION|windows.PROCESS_QUERY_INFORMATION, false, uint32(pid))
 	if err != nil {
 		return fmt.Errorf("打开进程失败（PID: %d）：%v", pid, err)
 	}

@@ -3,32 +3,47 @@
 <head>
     <meta charset="UTF-8"/>
     <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
-    <title>Fuck your ACE</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
-
-    <link href="./style.css" rel="stylesheet"/>
+    <title>FuckYourACE</title>
 </head>
 <body>
-<div id="app">
+<div class="container">
+    <h1>Fuck your ACE</h1>
+    <p class="subtitle">进程能效核绑定工具 v1.0</p>
 
-    <main class="content">
-        <textarea id="log-view" readonly></textarea>
-    </main>
-
-    <section class="progress-area">
-        <p id="progress-text">正在初始化...</p>
-        <div class="progress-bar-container">
-            <div id="progress-bar-fill"></div>
+    <div class="progress-bar-container">
+        <div class="progress-bar-text">... 60s 后下次执行 (已执行 0 次) ...</div>
+        <div class="progress-bar">
+            <div class="progress-bar-inner" style="width: 0%;"></div>
         </div>
-    </section>
+    </div>
 
-    <footer class="footer">
-        <p id="author-info">小工具作者: @罗素-Russell</p>
-        <p id="log-path"></p>
-        <a id="contact-link" href="https://space.bilibili.com/302158326" target="_blank">出现问题？联系作者</a>
-    </footer>
+    <div id="log-container"></div>
+
+    <div class="footer">
+
+        <div class="footer-stats">
+            <div>
+                <span>当前在线:</span>
+                <span id="online-users">...</span>
+            </div>
+            <div>
+                <span>累计执行:</span>
+                <span id="total-runs">...</span>
+            </div>
+        </div>
+
+        <div class="footer-info">
+            <p>小工具作者: @罗素-Russell</p>
+            <p>版本: v1.0.2</p>
+            <p id="log-path-display" class="log-path"></p>
+        </div>
+
+        <div class="footer-links">
+            <a href="" target="_blank">项目地址</a>
+            <a href="" target="_blank">问题反馈</a>
+        </div>
+    </div>
+
 </div>
 <script src="./main.js" type="module"></script>
 </body>
